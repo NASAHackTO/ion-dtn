@@ -1,0 +1,360 @@
+#!/bin/bash
+#
+# Scott Burleigh
+# October 11, 2010
+#
+# Tests "limbo" system:
+#
+#	a.  When an outduct is blocked, all bundles currently queued
+#	    for that outduct are removed from their queues and are
+#	    reforwarded; if no other outbound route is available, those
+#	    bundles are appended to the "limbo" queue.  In addition,
+#	    any new bundles that would otherwise be queued to the
+#	    blocked outduct are likewise appended to the "limbo" queue.
+#
+#	b.  When a blocked outduct is unblocked, all bundles in the
+#	    "limbo" queue are automatically reforwarded in hopes that
+#	    some or all of them may be transmitted via the newly
+#	    unblocked duct.
+#
+#	c.  Ducts may be manually blocked and unblocked by bpadmin
+#	    directives.
+#
+#	d.  Also, an EPIPE error on transmission over a TCP outduct
+#	    will cause that outduct to be blocked automatically;
+#	    a subsequent successful connection for that outduct (as
+#	    by a keepalive thread) will automatically unblock it.
+#
+# This test first sends a file over a TCP outduct, then uses bpadmin
+# to block the duct and tries to send a second file; the second file
+# goes into limbo and is released from limbo when we then use bpadmin
+# to unblock the duct.
+#
+# Then we test automatic TCP outduct blockage.  We again send a file,
+# then shut down the receiving node altogether, let the keepalive
+# thread detect the socket closure, blocking the outduct, and then
+# send another file.  The second file goes into limbo and is released
+# from limbo when the receiving node is restarted and reopens its TCP
+# socket, enabling the keepalive thread to unblock the outduct.
+#
+# Finally, we trigger an automatic blockage again. But, this time with
+# a backup contact active for the bundle to reForward through
+# when the preferred contact is blocked.
+
+#
+# Get the latest bp stat printed to an ion.log file
+#
+function getStatsCounter() {
+	TYPE=$1
+	PRI=$2
+	FILE=$3
+
+	grep "$TYPE from [0-9]" "$FILE" | tail -n 1 | sed "s/^.*($PRI) *\\([0-9]*\\)  *\\([0-9]*\\).*$/\\1/"
+}
+
+
+./cleanup
+sleep 1
+echo "Starting ION..."
+export ION_NODE_LIST_DIR=$PWD
+rm -f ./ion_nodes
+RETVAL=0
+
+
+# Start nodes.
+cd 3.ipn.tcp
+./ionstart
+cd ../5.ipn.tcp
+./ionstart
+cd ../2.ipn.tcp
+./ionstart
+echo "Sleeping 30 sec to give keepalive threads time to detect open sockets..."
+sleep 30
+
+# Start file receiver on node 3.
+cd ../3.ipn.tcp
+echo "Starting bprecvfile..."
+bprecvfile ipn:3.1 &
+sleep 1
+
+# Send one file from node 2.
+cd ../2.ipn.tcp
+echo "Sending first file from node 2 to node 3..."
+bpsendfile ipn:2.1 ipn:3.1 testfilex
+sleep 2
+
+# Verify that this file arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile1 | egrep 915 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Okay: got first copy of file x."
+else
+	echo ""
+	echo "Error: didn't get first copy of file x."
+	RETVAL=1
+fi
+
+echo ""
+# Now block transmission to node 3.
+cd ../2.ipn.tcp
+echo "Blocking outduct to node 3."
+bpadmin block.bprc
+sleep 2
+
+# Send second file from node 2.
+echo "Sending second file from node 2 to node 3, should go into limbo (j)..."
+bpsendfile ipn:2.1 ipn:3.1 testfiley
+sleep 2
+
+# Verify that this file has NOT arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile2 | egrep 1070 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Error: got first copy of file y already."
+	RETVAL=1
+else
+	echo ""
+	echo "Okay: didn't get first copy of file y."
+fi
+
+echo ""
+# Now unblock transmission to node 3; file should flow automatically.
+cd ../2.ipn.tcp
+echo "Unblocking outduct to node 3.  Bundle should flow out of limbo (k)..."
+bpadmin unblock.bprc
+sleep 2
+
+# Verify that the second file has now arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile2 | egrep 1070 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Okay: got first copy of file y."
+else
+	echo ""
+	echo "Error: didn't get first copy of file y."
+	RETVAL=1
+fi
+
+echo ""
+# Send third file from node 2.
+cd ../2.ipn.tcp
+echo "Sending third file from node 2 to node 3 to test unblocked outduct..."
+bpsendfile ipn:2.1 ipn:3.1 testfilez
+sleep 2
+
+# Verify that this file arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile3 | egrep 885 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Okay: got first copy of file z."
+else
+	echo ""
+	echo "Error: didn't get first copy of file z."
+	RETVAL=1
+fi
+
+echo ""
+# Now break TCP connectivity to node 3.
+echo "Breaking STCP connection to node 3 to test automatic blocking..."
+cd ../3.ipn.tcp
+./ionstop
+echo "Node 3 is stopped."
+echo "Sleeping 30 sec to give keepalive thread time to detect closed socket..."
+sleep 30
+
+# Send fourth file from node 2.
+cd ../2.ipn.tcp
+echo "Sending fourth file from node 2 to node 3 (should go into limbo -- j)..."
+bpsendfile ipn:2.1 ipn:3.1 testfiley
+sleep 2
+
+# Verify that this file has NOT arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile4 | egrep 1070 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Error: got second copy of file y already."
+	RETVAL=1
+else
+	echo ""
+	echo "Okay: didn't get second copy of file y."
+fi
+
+echo ""
+# Restore node 3's TCP socket.
+echo "Restoring STCP connectivity to node 3 to test automatic release."
+cd ../3.ipn.tcp
+./ionstart
+sleep 1
+rm testfile*
+echo "Restarting bprecvfile..."
+bprecvfile ipn:3.1 &
+echo "Sleeping 30 sec to give keepalive thread time to detect open socket..."
+sleep 30
+echo ""
+echo "Bundle for 4th file should have been released from limbo -- k."
+
+# Verify that the fourth file arrived.
+COUNT=`ls -l testfile1 | egrep 1070 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Okay: got second copy of file y."
+else
+	echo ""
+	echo "Error: didn't get second copy of file y."
+	RETVAL=1
+fi
+
+echo ""
+# Send one more file from node 2 to test the new connection.
+cd ../2.ipn.tcp
+echo "Sending fifth file from node 2 to node 3 to test restored connectivity..."
+bpsendfile ipn:2.1 ipn:3.1 testfilez
+sleep 2
+
+# Verify that this file arrived.
+cd ../3.ipn.tcp
+COUNT=`ls -l testfile2 | egrep 885 | wc -l`
+if [ $COUNT -eq 1 ]
+then
+	echo ""
+	echo "Okay: got second copy of file z."
+else
+	echo ""
+	echo "Error: didn't get second copy of file z."
+	RETVAL=1
+fi
+
+echo ""
+# Get the stats from node 2
+echo "Getting stats from node 2..."
+cd ../2.ipn.tcp
+bpstats 
+sleep 1
+START_COUNT=`getStatsCounter 'fwd' '+' ion.log`
+echo " -> $START_COUNT fwd bundles"
+
+
+# Send file from node 5 to verify route through node 2
+cd ../5.ipn.tcp
+echo "Sending sixth file from node 5 to node 2 to node 3 to verify 5 prefers that plan..."
+bpsendfile ipn:5.1 ipn:3.1 testfile5a
+sleep 2
+
+# Verify that this file arrived.
+cd ../3.ipn.tcp
+if grep -q 'test file 5a' testfile3
+then
+	echo ""
+	echo "Okay: got a copy of file 5a."
+else
+	echo ""
+	echo "Error: didn't get a copy of file 5a."
+	RETVAL=1
+fi
+
+echo ""
+# Get the stats from node 2 again
+echo "Getting stats from node 2 to verify it increased..."
+cd ../2.ipn.tcp
+bpstats 
+sleep 1
+END_COUNT=`getStatsCounter 'fwd' '+' ion.log`
+echo " -> $END_COUNT fwd bundles"
+
+if [ "$START_COUNT" -lt "$END_COUNT" ]
+then
+	echo ""
+	echo "Okay: bundle routed through node 2"
+else
+	echo ""
+	echo "Error: bundle didn't route through node 2. Results of test would be invalid"
+	echo "The configuration of node 5 needs to be setup to prefer to route through node 2"
+	RETVAL=1
+fi
+
+cd ../5.ipn.tcp
+NODE_5_TCPCLO_PID=`echo "i outduct stcp localhost:5001" | bpadmin | grep 'pid:' | sed 's/^.*pid: \([0-9]*\) .*$/\1/'`
+echo ""
+echo "Pausing node 5's stcpclo ($NODE_5_TCPCLO_PID), so it won't dequeue bundles"
+kill -STOP $NODE_5_TCPCLO_PID
+
+echo ""
+# Now break TCP connectivity to node 2.
+echo "Breaking STCP connection to node 2 to test re-routing..."
+cd ../2.ipn.tcp
+./ionstop
+echo "Node 2 is stopped."
+
+# Send file from node 5 to node 3
+cd ../5.ipn.tcp
+echo "Sending seventh file twice from node 5 to node 3 (should try to go through clo to node 2, but then be re-routed to go out the clo to node 3."
+bpsendfile ipn:5.1 ipn:3.1 testfile5b
+bpsendfile ipn:5.1 ipn:3.1 testfile5b
+
+echo "Resuming stcpclo..."
+kill -CONT $NODE_5_TCPCLO_PID
+sleep 30
+
+# Verify that this file has arrived twice.
+cd ../3.ipn.tcp
+if grep -q 'test file 5b' testfile4
+then
+	echo ""
+	echo "Okay: got first copy of file 5b"
+else
+	echo ""
+	echo "Error: didn't get first copy of file 5b."
+	RETVAL=1
+fi
+
+if grep -q 'test file 5b' testfile5
+then
+	echo ""
+	echo "Okay: got second copy of file 5b"
+else
+	echo ""
+	echo "Error: didn't get second copy of file 5b."
+	RETVAL=1
+fi
+
+# Print the bplist for debugging purposes
+echo ""
+echo "bplist for node 5:"
+cd ../5.ipn.tcp
+bplist
+echo ""
+echo "bplist for node 2:"
+cd ../2.ipn.tcp
+bplist
+echo ""
+echo "bplist for node 3:"
+cd ../3.ipn.tcp
+bplist
+
+
+echo ""
+# Shut down ION processes.
+echo "Stopping ION..."
+cd ../2.ipn.tcp
+./ionstop &
+cd ../3.ipn.tcp
+./ionstop &
+cd ../5.ipn.tcp
+./ionstop &
+
+# Give all three nodes time to shut down, then clean up.
+sleep 5
+killm
+echo "Limbo test completed."
+exit $RETVAL

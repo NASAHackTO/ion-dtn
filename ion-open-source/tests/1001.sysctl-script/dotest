@@ -1,0 +1,54 @@
+#!/bin/bash
+# Author: Robert Martin
+# Checks sysctl variable vaues on OSX to see if they are large enough
+# to handle the shared memory requirements for ION
+
+# documentation boilerplate
+echo "########################################"
+echo
+pwd | sed "s/\/.*\///" | xargs echo "NAME: "
+echo
+echo "PURPOSE: Determine if an Apple OSX host has the minimum memory required
+	for ION to run properly."
+echo
+echo "CONFIG: None"
+echo
+echo "OUTPUT: If the host is Apple OSX and memory is not sufficient, then you
+	will be informed how to edit system configuration files to meet minimum
+	memory requirements."
+echo
+echo "########################################"
+
+if ! sw_vers 2> /dev/null > /dev/null; then
+       echo "Not an OSX system, skipping test"
+       exit 2
+fi
+
+VAR_LIST=('shmmax' 'shmmin' 'shmmni' 'shmseg' 'shmall')
+VAR_VALUE=(20971520 1 32 128 8192)
+CUR_VALUE=0
+I=0
+CHANGE=0
+
+echo
+echo "If any lines appear below, copy and paste them into /etc/sysctl.conf and reboot."
+
+while [[ "$I" -lt  "5" ]]; do
+        CUR_VALUE=`sysctl kern.sysv.${VAR_LIST[$I]} | awk '{ print $2 }'`
+	#echo "Checking kern.sysv.${VAR_LIST[$I]} $CUR_VALUE  ${VAR_VALUE[$I]}"
+	if [[ $CUR_VALUE -lt "${VAR_VALUE[$I]}" ]]; then
+		echo "kern.sysv.${VAR_LIST[$I]}=${VAR_VALUE[I]}"
+                let CHANGE=1
+        fi
+        let I=$I+1
+done
+
+if [[ $CHANGE == 0 ]]; then
+	echo
+	echo "This system's shared memory is ready to run ION."
+	echo "No changes are needed."
+	exit 0
+fi
+
+#If there's a problem, we exit with an error
+exit 1
